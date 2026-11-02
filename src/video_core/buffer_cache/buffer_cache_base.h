@@ -259,6 +259,12 @@ public:
 
     void BindHostGeometryBuffers(bool is_indexed);
 
+    /// The vertex buffer slots the current draw reads, a bit each: BindHostVertexBuffers skips
+    /// the other enabled ones. All by default.
+    void SetUsedVertexBuffers(u32 mask) noexcept {
+        used_vertex_buffers_mask = mask;
+    }
+
     void BindHostStageBuffers(size_t stage);
 
     void BindHostComputeBuffers();
@@ -517,6 +523,7 @@ private:
     u32 last_index_count = 0;
 
     u32 enabled_vertex_buffers_mask = 0;
+    u32 used_vertex_buffers_mask = ~0U;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
 

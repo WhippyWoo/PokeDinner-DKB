@@ -1,7 +1,8 @@
 # Builds the emulator. Run from this folder:
 #   powershell -ExecutionPolicy Bypass -File .\build.ps1          (build; sets up the first time)
 #   powershell -ExecutionPolicy Bypass -File .\build.ps1 -Clean   (delete build\ first, start over)
-param([switch]$Clean)
+#   powershell -ExecutionPolicy Bypass -File .\build.ps1 -Jobs 4  (compile 4 files at a time: less memory)
+param([switch]$Clean, [int]$Jobs = 0)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -28,6 +29,6 @@ if (-not (Test-Path build\build.ninja)) {
         -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl "-DPATCH_EXE=$patch"
     if ($LASTEXITCODE -ne 0) { throw "Configure failed." }
 }
-cmake --build build
+if ($Jobs -gt 0) { cmake --build build -j $Jobs } else { cmake --build build }
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 Write-Host "Done: build\bin\eglantine.exe"

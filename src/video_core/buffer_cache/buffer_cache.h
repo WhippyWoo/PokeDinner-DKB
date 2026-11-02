@@ -901,7 +901,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
 
     if (use_optimized_vertex_buffers) {
         auto& flags = maxwell3d->dirty.flags;
-        u32 enabled_mask = enabled_vertex_buffers_mask;
+        u32 enabled_mask = enabled_vertex_buffers_mask & used_vertex_buffers_mask;
         HostBindings<Buffer> bindings{};
         u32 last_index = (std::numeric_limits<u32>::max)();
         const auto flush_bindings = [&]() {
@@ -1451,6 +1451,13 @@ void BufferCache<P>::UpdateVertexBuffers() {
     flags[Dirty::VertexBuffers] = false;
 
     for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
+        if ((used_vertex_buffers_mask & (1U << index)) == 0) {
+            // Not read by this draw: look it up when a draw reads it (SetUsedVertexBuffers).
+            if (flags[Dirty::VertexBuffer0 + index]) {
+                flags[Dirty::VertexBuffers] = true;
+            }
+            continue;
+        }
         UpdateVertexBuffer(index);
     }
 }

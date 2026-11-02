@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+#include <cstdlib>
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -284,6 +286,11 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    for (u32 index = 0; index < 32; ++index) {
+        if (stage_infos[0].loads.Generic(index)) {
+            vertex_loads_mask |= 1U << index;
+        }
+    }
 
     DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
@@ -541,8 +548,25 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        // Only the vertex buffers this draw's vertex shader reads are checked and bound: NVN2
+        // leaves ~12 streams enabled per draw. EDEN_NX2_USED_VERTEX_BUFFERS=0 uses every one.
+        static const bool used_only = [] {
+            const char* value = std::getenv("EDEN_NX2_USED_VERTEX_BUFFERS");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (used_only) {
+            u32 used = 0;
+            for (u32 mask = vertex_loads_mask; mask != 0; mask &= mask - 1) {
+                const auto& attribute = regs.vertex_attrib_format[std::countr_zero(mask)];
+                if (!attribute.constant) {
+                    used |= 1U << attribute.buffer.Value();
+                }
+            }
+            buffer_cache.SetUsedVertexBuffers(used);
+        }
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
+        buffer_cache.SetUsedVertexBuffers(~0U);
     }
 
     {

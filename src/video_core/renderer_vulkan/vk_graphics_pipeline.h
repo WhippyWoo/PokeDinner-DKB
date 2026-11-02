@@ -170,6 +170,7 @@ private:
     std::shared_ptr<const GraphicsShaderModules> spv_modules;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+    u32 vertex_loads_mask{}; ///< Generic vertex inputs the vertex shader reads, a bit each
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
