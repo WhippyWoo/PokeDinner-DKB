@@ -101,11 +101,17 @@ bool DmaPusher::Step() {
         synced = false;
     }
 
+    // EDEN_NX2_INDIRECT_TERRAIN: this entry is the GPU-written draw record of an indirect draw
+    // macro call, which the host GPU reads itself: no wait for the back, no flush.
+    bool indirect_record = false;
     if (header.size > 0) {
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
             const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
+            indirect_record = macro_payload && header.size == dma_state.method_count &&
+                              static_cast<Engines::Maxwell3D*>(subchannels[dma_state.subchannel])
+                                  ->FrontTakesIndirectRecord(system, dma_state.dma_get, header.size);
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
@@ -119,7 +125,7 @@ bool DmaPusher::Step() {
                     return value == nullptr || value[0] != '0';
                 }();
                 bool flushed_parameters = false;
-                if (flush_parameters && words <= 64) {
+                if (flush_parameters && words <= 64 && !indirect_record) {
                     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                         split.Drain();
                     }
@@ -190,7 +196,9 @@ bool DmaPusher::Step() {
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            if (!indirect_record) {
+                FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            }
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);

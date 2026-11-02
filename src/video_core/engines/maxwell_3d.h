@@ -3230,6 +3230,11 @@ public:
 
     size_t EstimateIndexBufferSize();
 
+    /// EDEN_NX2_INDIRECT_TERRAIN: on the split's front, whether the `words` at `address` are the
+    /// 5-word draw record of a pending NVN2 indexed indirect draw macro call (Donkey Kong Bananza's
+    /// terrain). If so, the macro's draw reads them on the host GPU and they need no flush.
+    bool FrontTakesIndirectRecord(Core::System& system, GPUVAddr address, size_t words);
+
     /// Handles a write to the CLEAR_BUFFERS register.
     void ProcessClearBuffers(u32 layer_count);
 
@@ -3350,6 +3355,7 @@ private:
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    bool IsIndirectDrawMacro(u32 start);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);

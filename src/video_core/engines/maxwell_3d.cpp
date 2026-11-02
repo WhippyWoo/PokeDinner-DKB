@@ -9,6 +9,8 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <unordered_map>
+#include <utility>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -21,6 +23,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
@@ -811,7 +814,26 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// GPU address of the pending macro call's draw record (FrontTakesIndirectRecord), or 0.
+    GPUVAddr indirect_record{};
 };
+
+namespace {
+
+// NVN2's indexed indirect draw macro (Donkey Kong Bananza's terrain), 14 instructions. Its
+// parameters: topology, then a 5-word record {count, instances, first index, base vertex,
+// base instance} that a culling pass on the GPU fills in.
+constexpr std::array<u32, 42> NX2_INDIRECT_DRAW_MACRO{
+    0x00000003, 0x1d180000, 0x31c20300, 0x00940003, 0x18c0017d, 0xf1c10300,
+    0x3c745437, 0x1d000111, 0xb1c08300, 0x6a201903, 0x18c00638, 0xf00c0300,
+    0x20200003, 0x00c00000, 0x301c0300, 0x00000003, 0x18c02001, 0x702c7700,
+    0x2c3417e3, 0x03c00161, 0xb04c0300, 0x01140003, 0x18c00161, 0x718c0300,
+    0x00000007, 0x22109a10, 0x34424300, 0x00000003, 0x18c007ff, 0x702c7700,
+    0x9d141437, 0x18c00111, 0xb18c0300, 0x0d14638f, 0x18c00143, 0xb18c0300,
+    0x60a00003, 0x18c00190, 0x318c0301, 0x00a00003, 0x18c00000, 0x318c0300,
+};
+
+} // Anonymous namespace
 
 namespace {
 
@@ -1065,6 +1087,56 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
 }
 
+bool Maxwell3D::IsIndirectDrawMacro(u32 start) {
+    // Only the split's front calls this: plain statics.
+    static u64 generation = ~u64{0};
+    static std::unordered_map<u32, bool> known;
+    auto& engine = GetNativeMacroEngine();
+    if (generation != engine.native_code_generation) {
+        generation = engine.native_code_generation;
+        known.clear();
+    }
+    const auto [it, inserted] = known.try_emplace(start, false);
+    if (inserted) {
+        const auto& code = engine.native_code;
+        const size_t first = size_t{start} * 3;
+        it->second = first + NX2_INDIRECT_DRAW_MACRO.size() <= code.size() &&
+                     std::equal(NX2_INDIRECT_DRAW_MACRO.begin(), NX2_INDIRECT_DRAW_MACRO.end(),
+                                code.begin() + first);
+        if (it->second) {
+            LOG_INFO(HW_GPU, "Indexed indirect draw macro at {:#x}: its records are drawn on the GPU", start);
+        }
+    }
+    return it->second;
+}
+
+bool Maxwell3D::FrontTakesIndirectRecord(Core::System& system, GPUVAddr address, size_t words) {
+    // On for Donkey Kong Bananza (040074A01BF12000); EDEN_NX2_INDIRECT_TERRAIN=0/1 forces it.
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_INDIRECT_TERRAIN");
+        return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
+    }();
+    const bool enabled = forced >= 0 ? forced == 1
+                                     : Tegra::g_nx2_program_id.load(std::memory_order_relaxed) ==
+                                           0x040074A01BF12000ULL;
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!enabled || words != 5 || !split.Active() || !split.FrontMacros()) {
+        return false;
+    }
+    auto& fs = Front(system, split);
+    // The topology came in the previous entry; the record is the rest of the call.
+    if (fs.executing_macro < MacroRegistersStart || fs.parameters.size() != 1) {
+        return false;
+    }
+    const auto positions = GetNativeMacroPositions();
+    const u32 start = positions[((fs.executing_macro - MacroRegistersStart) >> 1) % positions.size()];
+    if (!IsIndirectDrawMacro(start)) {
+        return false;
+    }
+    fs.indirect_record = address;
+    return true;
+}
+
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
 #ifdef ARCHITECTURE_x86_64
@@ -1073,6 +1145,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    // EDEN_NX2_INDIRECT_TERRAIN: the draw record was left in GPU memory (FrontTakesIndirectRecord).
+    // The macro runs as usual, but its draw becomes one indirect draw that reads the record on the
+    // host GPU, so the record never has to be copied back first.
+    const GPUVAddr indirect_record = std::exchange(fs.indirect_record, GPUVAddr{});
+    const bool indirect = indirect_record != 0 && fs.parameters.size() == 6;
+    bool indirect_sent = false;
     {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         engine.native_interpreter.active_dram = &native_data_ram;
@@ -1087,6 +1165,29 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             [&](u32 address, u32 value) {
                 if (address >= MacroRegistersStart) {
                     return false;
+                }
+                if (indirect && (address == 0x585 || address == 0x586 || address == 0x5f8)) {
+                    // END, BEGIN and the index count: one indirect draw replaces them.
+                    if (address == 0x586 && !indirect_sent) {
+                        indirect_sent = true;
+                        const auto topology = static_cast<Regs::PrimitiveTopology>(value & 0xffff);
+                        split.Defer([this, system_ptr = &system, indirect_record, topology] {
+                            ConsumeSink(*system_ptr);
+                            auto& params = draw_manager.indirect_state;
+                            params.is_byte_count = false;
+                            params.is_indexed = true;
+                            params.include_count = false;
+                            params.count_start_address = 0;
+                            params.indirect_start_address = indirect_record;
+                            params.buffer_size = 5 * sizeof(u32);
+                            params.max_draw_counts = 1;
+                            params.stride = 0;
+                            dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+                            draw_manager.DrawIndexedIndirect(
+                                *this, topology, 0, static_cast<u32>(EstimateIndexBufferSize()));
+                        });
+                    }
+                    return true;
                 }
                 FrontWrite(split, fs, address, value, true, true);
                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).

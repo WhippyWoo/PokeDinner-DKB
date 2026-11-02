@@ -503,6 +503,19 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    // A draw with no vertices or no instances draws nothing (Donkey Kong Bananza's culled terrain
+    // pieces): skip its setup. EDEN_NX2_SKIP_EMPTY=0 turns this off.
+    static const bool skip_empty = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_EMPTY");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (skip_empty) {
+        const auto& state = maxwell3d->draw_manager.draw_state;
+        const u32 count = is_indexed ? state.index_buffer.count : state.vertex_buffer.count;
+        if (count == 0 || instance_count == 0) {
+            return;
+        }
+    }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
