@@ -15,7 +15,7 @@
 </h1>
 
 <h4 align="center"><b>Eglantine</b> is a free and opensource (FOSS) Switch 2 emulator, derived from Eden, Yuzu and Sudachi - started by developer Camille LaVey.
-It's written in C++ with portability in mind, with builds for Windows, Linux and macOS - This is a fork based off the PokeDinner fork by Franseven [here](https://git.eden-emu.dev/Franseven/PokeDinner-a-Eglantine-Fork).
+It's written in C++ with portability in mind, with builds for Windows, Linux and macOS - This is a fork based off the PokeDinner fork by Franseven (https://git.eden-emu.dev/Franseven/PokeDinner-a-Eglantine-Fork)
 </h4>
 
 <p align="center">
