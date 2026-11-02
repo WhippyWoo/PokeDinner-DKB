@@ -451,7 +451,7 @@ private:
     void RemoveFramebuffers(std::span<const ImageViewId> removed_views);
 
     /// Mark an image as modified from the GPU
-    void MarkModification(ImageBase& image) noexcept;
+    void MarkModification(ImageId id, ImageBase& image) noexcept;
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
@@ -571,6 +571,20 @@ private:
 
     u64 modification_tick = 0;
     u64 frame_tick = 0;
+
+    /// Every image's modification_tick by slot index, side by side, so SynchronizeAliases can
+    /// rule out newer aliases without reading each alias' ImageBase (a cache miss each). Never
+    /// below an image's own tick: both are written by SetModificationTick, and a slot reused by
+    /// a new image (tick 0) can only keep a higher one, which just takes the full check.
+    std::vector<u64> image_ticks;
+
+    void SetModificationTick(ImageId id, ImageBase& image, u64 tick) {
+        image.modification_tick = tick;
+        if (id.index >= image_ticks.size()) {
+            image_ticks.resize(size_t{id.index} + 1);
+        }
+        image_ticks[id.index] = tick;
+    }
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

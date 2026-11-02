@@ -34,6 +34,7 @@
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/pipeline_stats.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
@@ -439,8 +440,13 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
     const char* const tensor_override = std::getenv("EDEN_NX2_TENSOR");
+    // Donkey Kong Bananza (040074A01BF12000) draws its world through a tensor-core upscaler;
+    // without it the screen keeps its last image (the loading card) until camera mode.
+    const bool tensor_full = native_tensor_full_by_default ||
+                             Tegra::g_nx2_program_id.load(std::memory_order_relaxed) ==
+                                 0x040074A01BF12000ULL;
     const std::string_view tensor_mode =
-        tensor_override ? tensor_override : (native_tensor_full_by_default ? "full" : "");
+        tensor_override ? tensor_override : (tensor_full ? "full" : "");
     auto lowered = Shader::Ampere::LowerToMaxwell(native, tensor_mode);
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).

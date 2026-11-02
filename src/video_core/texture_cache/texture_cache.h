@@ -351,7 +351,7 @@ typename P::ImageView& TextureCache<P>::GetImageView(u32 index) noexcept {
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageId id) noexcept {
-    MarkModification(slot_images[id]);
+    MarkModification(id, slot_images[id]);
 }
 
 template <class P>
@@ -2192,7 +2192,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
             CopyImage(new_image_id, aliased.id, aliased.copies);
-            new_image.modification_tick = overlap.modification_tick;
+            SetModificationTick(new_image_id, new_image, overlap.modification_tick);
             continue;
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -2207,7 +2207,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             } else {
                 runtime.CopyImage(new_image, overlap, copies);
             }
-            new_image.modification_tick = overlap.modification_tick;
+            SetModificationTick(new_image_id, new_image, overlap.modification_tick);
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, copy_object.id);
@@ -3116,15 +3116,31 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 }
 
 template <class P>
-void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+void TextureCache<P>::MarkModification(ImageId id, ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
-    image.modification_tick = ++modification_tick;
+    SetModificationTick(id, image, ++modification_tick);
 }
 
 template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    // Fast exit: image_ticks is never below an image's real tick, so when no alias' entry there is
+    // newer than this image, no alias is. EDEN_NX2_ALIAS_TICKS=0 always takes the full check.
+    static const bool use_ticks = [] {
+        const char* value = std::getenv("EDEN_NX2_ALIAS_TICKS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (use_ticks) {
+        const u64 own_tick = image.modification_tick;
+        const bool maybe_newer = std::ranges::any_of(image.aliased_images, [&](const AliasedImage& aliased) {
+            const u32 index = aliased.id.index;
+            return index < image_ticks.size() && image_ticks[index] > own_tick;
+        });
+        if (!maybe_newer) {
+            return;
+        }
+    }
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
     u64 most_recent_tick = image.modification_tick;
@@ -3148,7 +3164,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
             ScaleDown(image);
         }
     }
-    image.modification_tick = most_recent_tick;
+    SetModificationTick(image_id, image, most_recent_tick);
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
     }
@@ -3206,7 +3222,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
         }
-        MarkModification(image);
+        MarkModification(image_id, image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
 }
