@@ -89,6 +89,35 @@ public:
         Commit(2 + payload);
     }
     void DeferFunction(std::function<void()>&& func);
+    /// As Defer, for work that may run while terrain draws wait (Hold): it neither draws nor
+    /// changes state those draws read, or it ends the hold itself first.
+    template <typename Func>
+    void DeferPassing(const Func& func) {
+        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        u64* const entry = Reserve(2 + payload);
+        entry[0] = static_cast<u64>(Kind::Call) | Passes | (u64{payload} << 8);
+        entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
+        std::memcpy(entry + 2, &func, sizeof(Func));
+        Commit(2 + payload);
+    }
+
+    /// Terrain batching (back thread only): while held, `engine`'s terrain draws wait in its own
+    /// list. Before any entry they can't let pass (`passes` says which of `engine`'s method
+    /// writes can), and before the back goes idle, the split calls `flush` to draw them.
+    using HoldFlush = void (*)(void* context);
+    using HoldPasses = bool (*)(void* context, u32 method, u32 argument);
+    void Hold(Tegra::Engines::EngineInterface* engine, void* context, HoldFlush flush,
+              HoldPasses passes) {
+        hold_engine = engine;
+        hold_context = context;
+        hold_flush = flush;
+        hold_passes = passes;
+    }
+    /// Ends a hold without calling `flush` (its owner drew the list itself).
+    void EndHold() {
+        hold_flush = nullptr;
+    }
 
     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
     /// using back-owned state (the Vulkan scheduler) while the back runs entries.
@@ -111,6 +140,7 @@ private:
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+    static constexpr u64 Passes = 1 << 7; ///< Call: may run while terrain draws wait (Hold)
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
@@ -148,6 +178,12 @@ private:
 
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
+    bool EntryPassesHold(const u64* entry);
+    void ReleaseHold() {
+        const HoldFlush flush = hold_flush;
+        hold_flush = nullptr;
+        flush(hold_context);
+    }
 
     Core::System* system{};
     bool active{};
@@ -164,6 +200,10 @@ private:
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
+    Tegra::Engines::EngineInterface* hold_engine{};
+    void* hold_context{};
+    HoldFlush hold_flush{};
+    HoldPasses hold_passes{};
 
     static GpuSplit instance;
 

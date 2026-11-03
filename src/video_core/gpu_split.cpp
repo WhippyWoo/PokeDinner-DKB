@@ -255,7 +255,28 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
     });
 }
 
+bool GpuSplit::EntryPassesHold(const u64* entry) {
+    const u64 head = entry[0];
+    switch (static_cast<Kind>(head & 0xf)) {
+    case Kind::Wrap:
+    case Kind::Engine:
+        return true;
+    case Kind::Method:
+        return back_engine == hold_engine &&
+               hold_passes(hold_context, static_cast<u32>((head >> 8) & 0xffff),
+                           static_cast<u32>(head >> 32));
+    case Kind::Multi:
+        return false;
+    case Kind::Call:
+        return (head & Passes) != 0;
+    }
+    return false;
+}
+
 size_t GpuSplit::Execute(const u64* entry) {
+    if (hold_flush != nullptr && !EntryPassesHold(entry)) [[unlikely]] {
+        ReleaseHold();
+    }
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
@@ -349,6 +370,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 consumed.store(read_position, std::memory_order_release);
                 last_store = read_position;
             }
+        }
+        // Waiting terrain draws go out before the back reports itself caught up (Drain).
+        if (hold_flush != nullptr && published.load(std::memory_order_acquire) == read_position) {
+            ReleaseHold();
         }
         g_back_busy.store(false, std::memory_order_release);
         consumed.store(read_position, std::memory_order_release);

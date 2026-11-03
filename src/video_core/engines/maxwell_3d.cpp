@@ -343,6 +343,8 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
     // c[0][0x644]) right after the loop, before the macro returns.
     if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+        // Waiting terrain draws came before this deferred draw: they go first.
+        FlushTerrainBatch();
         draw_manager.DrawDeferred(*this);
     }
     regs.reg_array[method] = argument;
@@ -1171,20 +1173,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     if (address == 0x586 && !indirect_sent) {
                         indirect_sent = true;
                         const auto topology = static_cast<Regs::PrimitiveTopology>(value & 0xffff);
-                        split.Defer([this, system_ptr = &system, indirect_record, topology] {
+                        split.DeferPassing([this, system_ptr = &system, indirect_record, topology] {
                             ConsumeSink(*system_ptr);
-                            auto& params = draw_manager.indirect_state;
-                            params.is_byte_count = false;
-                            params.is_indexed = true;
-                            params.include_count = false;
-                            params.count_start_address = 0;
-                            params.indirect_start_address = indirect_record;
-                            params.buffer_size = 5 * sizeof(u32);
-                            params.max_draw_counts = 1;
-                            params.stride = 0;
-                            dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
-                            draw_manager.DrawIndexedIndirect(
-                                *this, topology, 0, static_cast<u32>(EstimateIndexBufferSize()));
+                            QueueTerrainDraw(indirect_record, topology);
                         });
                     }
                     return true;
@@ -1205,7 +1196,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     fs.parameters.clear();
     if (fs.draw_pending) {
         fs.draw_pending = false;
-        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
+        split.DeferPassing([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); });
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
@@ -1300,9 +1291,121 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
 }
 
 void Maxwell3D::FinishFrontMacro(Core::System& system) {
-    // What ProcessMacro and CallMacroMethod do around the macro.
+    // What ProcessMacro and CallMacroMethod do around the macro. It may pass waiting terrain
+    // draws (DeferPassing): the sink holds only writes they let pass, and a deferred draw, the
+    // one thing here that draws, sends them first.
     ConsumeSink(system);
+    if (draw_manager.HasDeferredDraw()) {
+        FlushTerrainBatch();
+    }
     draw_manager.DrawDeferred(*this);
+}
+
+std::array<u32, Maxwell3D::TerrainRegisters.size() + 1> Maxwell3D::CaptureTerrainRegisters() const {
+    std::array<u32, TerrainRegisters.size() + 1> values{};
+    for (size_t i = 0; i < TerrainRegisters.size(); ++i) {
+        values[i] = regs.reg_array[TerrainRegisters[i]];
+    }
+    values.back() = regs.reg_array[0x50e];
+    return values;
+}
+
+void Maxwell3D::RestoreTerrainRegisters(const std::array<u32, TerrainRegisters.size() + 1>& values) {
+    // As ProcessDirtyRegisters, without its deferred-draw step (none can be pending here).
+    const auto restore = [&](u32 method, u32 value) {
+        if (regs.reg_array[method] == value) {
+            return;
+        }
+        regs.reg_array[method] = value;
+        for (const auto& table : dirty.tables) {
+            dirty.flags[table[method]] = true;
+        }
+    };
+    for (size_t i = 0; i < TerrainRegisters.size(); ++i) {
+        restore(TerrainRegisters[i], values[i]);
+    }
+    restore(0x50e, values.back());
+}
+
+void Maxwell3D::DrawTerrain(GPUVAddr record, Regs::PrimitiveTopology topology) {
+    auto& params = draw_manager.indirect_state;
+    params.is_byte_count = false;
+    params.is_indexed = true;
+    params.include_count = false;
+    params.count_start_address = 0;
+    params.indirect_start_address = record;
+    params.buffer_size = 5 * sizeof(u32);
+    params.max_draw_counts = 1;
+    params.stride = 0;
+    dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+    draw_manager.DrawIndexedIndirect(*this, topology, 0, static_cast<u32>(EstimateIndexBufferSize()));
+}
+
+void Maxwell3D::QueueTerrainDraw(GPUVAddr record, Regs::PrimitiveTopology topology) {
+    static const bool batch = [] {
+        const char* value = std::getenv("EDEN_NX2_TERRAIN_BATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!batch) {
+        DrawTerrain(record, topology);
+        return;
+    }
+    if (terrain_batch.empty()) {
+        VideoCommon::GpuSplit::Get().Hold(
+            this, this, [](void* context) { static_cast<Maxwell3D*>(context)->FlushTerrainBatch(); },
+            [](void* context, u32 method, u32 argument) {
+                return static_cast<const Maxwell3D*>(context)->TerrainWritePasses(method, argument);
+            });
+    }
+    terrain_batch.push_back({record, topology, CaptureTerrainRegisters()});
+    if (terrain_batch.size() >= 4096) {
+        FlushTerrainBatch();
+    }
+}
+
+void Maxwell3D::FlushTerrainBatch() {
+    VideoCommon::GpuSplit::Get().EndHold();
+    if (terrain_batch.empty()) {
+        return;
+    }
+    // Each draw sees its own per-draw registers; afterwards they hold what they held before.
+    const auto current = CaptureTerrainRegisters();
+    for (const TerrainDraw& draw : terrain_batch) {
+        RestoreTerrainRegisters(draw.values);
+        DrawTerrain(draw.record, draw.topology);
+    }
+    RestoreTerrainRegisters(current);
+    terrain_batch.clear();
+}
+
+bool Maxwell3D::TerrainWritePasses(u32 method, u32 argument) const {
+    switch (method) {
+    case 0x5f3: // index buffer address
+    case 0x5f7: // index buffer first
+    case 0x702: // vertex stream 0 address
+    case 0x181: // vertex stream 0 size
+    case 0x446: // base vertex
+    case 0x50d:
+    case 0x50e: // base instance
+    case MAXWELL3D_REG_INDEX(const_buffer.offset):
+        return true;
+    case MAXWELL3D_REG_INDEX(const_buffer.buffer):
+    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 1: {
+        // The draw macro's base vertex and instance, c[0x640] and c[0x644]: always 0 in this
+        // game. Any other constant data stops the batch. Each data write lands at the current
+        // offset (then moves it on); a new offset may still be waiting in the sink.
+        u32 offset = regs.const_buffer.offset;
+        for (auto it = method_sink.rbegin(); it != method_sink.rend(); ++it) {
+            if (it->first == MAXWELL3D_REG_INDEX(const_buffer.offset)) {
+                offset = it->second;
+                break;
+            }
+        }
+        return argument == 0 && (offset == 0x640 || offset == 0x644);
+    }
+    default:
+        return false;
+    }
 }
 
 } // namespace Tegra::Engines

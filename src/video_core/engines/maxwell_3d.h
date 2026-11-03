@@ -3356,6 +3356,28 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool IsIndirectDrawMacro(u32 start);
+
+    // Terrain batching (EDEN_NX2_TERRAIN_BATCH): the indirect terrain draws wait in a list on the
+    // back while nothing but their own per-draw registers changes, then are drawn in order.
+    // The registers each one changes, with their values for it.
+    static constexpr std::array<u32, 14> TerrainRegisters{
+        0x5f2, 0x5f3, 0x5f4, 0x5f5, 0x5f6, 0x5f7, 0x5f8, // index buffer
+        0x700, 0x701, 0x702, 0x703,                      // vertex stream 0
+        0x181,                                           // vertex stream 0 size (NX2)
+        0x446, 0x50d,                                    // base vertex
+    };
+    struct TerrainDraw {
+        GPUVAddr record;
+        Regs::PrimitiveTopology topology;
+        std::array<u32, TerrainRegisters.size() + 1> values; // + 0x50e, base instance
+    };
+    std::vector<TerrainDraw> terrain_batch;
+    std::array<u32, TerrainRegisters.size() + 1> CaptureTerrainRegisters() const;
+    void RestoreTerrainRegisters(const std::array<u32, TerrainRegisters.size() + 1>& values);
+    void DrawTerrain(GPUVAddr record, Regs::PrimitiveTopology topology);
+    void QueueTerrainDraw(GPUVAddr record, Regs::PrimitiveTopology topology);
+    void FlushTerrainBatch();
+    bool TerrainWritePasses(u32 method, u32 argument) const;
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);

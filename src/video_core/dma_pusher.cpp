@@ -145,7 +145,8 @@ bool DmaPusher::Step() {
                     engine_state->current_dirty = false;
                 } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
-                    split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
+                    // Only reads cache state: may run while terrain draws wait (DeferPassing).
+                    split.DeferPassing([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
                         engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
                     });
