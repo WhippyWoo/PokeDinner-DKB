@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
@@ -667,6 +668,34 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     const u32 max_binding = (std::min)(bindings.max_index, device_max);
     const u32 binding_count = max_binding - min_binding;
     if (binding_count == 0) {
+        return;
+    }
+    // Most draws bind one to four streams. Record just those instead of four 32-entry lists
+    // (~1.4 KiB per command), so the scheduler's 32 KiB command chunks fill up far less often.
+    // EDEN_NX2_SMALL_VERTEX_BIND=0 records the full lists as before.
+    static const bool small_bind = [] {
+        const char* value = std::getenv("EDEN_NX2_SMALL_VERTEX_BIND");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (small_bind && binding_count <= 4 && bindings.buffers.size() >= binding_count) {
+        std::array<VkBuffer, 4> handles{};
+        std::array<VkDeviceSize, 4> offsets{}, sizes{}, strides{};
+        for (u32 i = 0; i < binding_count; ++i) {
+            handles[i] = buffer_handles[i];
+            offsets[i] = bindings.offsets[i];
+            sizes[i] = bindings.sizes[i];
+            strides[i] = bindings.strides[i];
+        }
+        const u32 first = bindings.min_index;
+        if (device.IsExtExtendedDynamicStateSupported()) {
+            scheduler.Record([first, binding_count, handles, offsets, sizes, strides](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(first, binding_count, handles.data(), offsets.data(), sizes.data(), strides.data());
+            });
+        } else {
+            scheduler.Record([first, binding_count, handles, offsets](vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers(first, binding_count, handles.data(), offsets.data());
+            });
+        }
         return;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
